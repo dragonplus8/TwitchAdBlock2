@@ -29,7 +29,7 @@
 #import <Foundation/Foundation.h>
 #import <os/log.h>
 #import <objc/runtime.h>
-#import <stdatomic.h>
+#import <stdint.h>
 #import "SettingsKeys.h"
 #import "NSURL+TwitchAdBlock.h"
 #import "NSData+TwitchAdBlock.h"
@@ -47,7 +47,10 @@ extern NSUserDefaults *tweakDefaults;
 // ─── Emote registry ─────────────────────────────────────────────────────────
 //
 // Synthetic numeric IDs in [9_000_000_000, 9_999_999_999]. Real Twitch IDs are
-// always < 10 digits (~hundreds of millions) so no collision risk.
+// always < 10 digits (~hundreds of millions) so no collision risk. IDs must be
+// stable between launches: Twitch caches emote images by the original native
+// URL, so reassigning yesterday's fake ID to a different emote today can show a
+// completely unrelated cached image.
 
 static NSString *const TWAB_GLOBAL_ROOM = @"__global__";
 static const NSUInteger TWAB_MAX_ROOMS = 50;
@@ -95,21 +98,54 @@ static NSMutableArray<NSString *> *twab_lruRooms(void) {
     return a;
 }
 
-// room -> set of fakeIds registered against that room. Used by eviction to
-// reverse-look up which entries to drop.
-static NSMutableDictionary<NSString *, NSMutableSet<NSString *> *> *twab_roomFakeIds(void) {
+// room -> fakeId -> reference count for that room. Used by eviction to
+// reverse-look up which shared CDN mappings can be dropped.
+static NSMutableDictionary<NSString *, NSMutableDictionary<NSString *, NSNumber *> *> *twab_roomFakeIds(void) {
     static NSMutableDictionary *m;
     static dispatch_once_t once;
     dispatch_once(&once, ^{ m = [NSMutableDictionary dictionary]; });
     return m;
 }
 
-// Monotonically increasing synthetic ID generator. Starts at 9_000_000_000 so
-// it never collides with real Twitch numeric IDs (which top out around
-// 3 billion as of 2025) or with v2 ids (which contain underscores).
-static uint64_t twab_nextSyntheticId(void) {
-    static _Atomic uint64_t counter = 9000000000;
-    return atomic_fetch_add(&counter, 1);
+// fakeId -> number of registry entries that reference it. Multiple words or
+// rooms can legitimately point at the same provider emote; this lets room LRU
+// eviction remove the CDN mapping only after its last reference disappears.
+static NSMutableDictionary<NSString *, NSNumber *> *twab_fakeIdRefCounts(void) {
+    static NSMutableDictionary *m;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ m = [NSMutableDictionary dictionary]; });
+    return m;
+}
+
+// FNV-1a gives the same numeric ID to a provider emote on every launch. In the
+// extremely unlikely event of a collision inside the 1-billion-ID reserved
+// range, probe forward until an unused slot is found. Caller holds the emote
+// queue's barrier.
+static NSString *twab_stableSyntheticIdLocked(NSString *provider,
+                                               NSString *realId) {
+    NSString *key = [NSString stringWithFormat:@"%@:%@", provider, realId];
+    NSData *data = [key dataUsingEncoding:NSUTF8StringEncoding];
+    const uint8_t *bytes = data.bytes;
+    uint64_t hash = UINT64_C(14695981039346656037);
+    for (NSUInteger i = 0; i < data.length; i++) {
+        hash ^= bytes[i];
+        hash *= UINT64_C(1099511628211);
+    }
+
+    static const uint64_t base = UINT64_C(9000000000);
+    static const uint64_t range = UINT64_C(1000000000);
+    uint64_t offset = hash % range;
+    for (uint64_t probe = 0; probe < range; probe++) {
+        uint64_t numericId = base + ((offset + probe) % range);
+        NSString *fakeId = [NSString stringWithFormat:@"%llu", numericId];
+        NSDictionary *existing = twab_byFakeId()[fakeId];
+        if (!existing ||
+            ([existing[@"provider"] isEqualToString:provider] &&
+             [existing[@"id"] isEqualToString:realId])) {
+            return fakeId;
+        }
+    }
+    return nil;
 }
 
 // Register an emote word -> (provider, realId, animated, room). Allocates a
@@ -138,7 +174,8 @@ static void twab_registerEmote(NSString *word, NSString *provider,
         }
         if (providers[provider]) return;
 
-        NSString *fakeId = [NSString stringWithFormat:@"%llu", twab_nextSyntheticId()];
+        NSString *fakeId = twab_stableSyntheticIdLocked(provider, realId);
+        if (!fakeId) return;
         NSDictionary *entry = @{@"provider": provider,
                                 @"id": realId,
                                 @"fake": fakeId,
@@ -146,13 +183,18 @@ static void twab_registerEmote(NSString *word, NSString *provider,
                                 @"room": roomKey,
                                 @"animated": @(animated)};
         providers[provider] = entry;
-        twab_byFakeId()[fakeId] = entry;
-        NSMutableSet *set = twab_roomFakeIds()[roomKey];
-        if (!set) {
-            set = [NSMutableSet set];
-            twab_roomFakeIds()[roomKey] = set;
+        if (!twab_byFakeId()[fakeId]) twab_byFakeId()[fakeId] = entry;
+
+        NSUInteger totalRefs = [twab_fakeIdRefCounts()[fakeId] unsignedIntegerValue];
+        twab_fakeIdRefCounts()[fakeId] = @(totalRefs + 1);
+
+        NSMutableDictionary *roomRefs = twab_roomFakeIds()[roomKey];
+        if (!roomRefs) {
+            roomRefs = [NSMutableDictionary dictionary];
+            twab_roomFakeIds()[roomKey] = roomRefs;
         }
-        [set addObject:fakeId];
+        NSUInteger roomCount = [roomRefs[fakeId] unsignedIntegerValue];
+        roomRefs[fakeId] = @(roomCount + 1);
     });
 }
 
@@ -165,15 +207,23 @@ static void twab_evictOldestRoomsLocked(void) {
         NSString *evicted = lru.firstObject;
         [lru removeObjectAtIndex:0];
         [twab_loadedRooms() removeObject:evicted];
-        NSSet *fakeIds = [twab_roomFakeIds()[evicted] copy];
-        for (NSString *fakeId in fakeIds) {
-            [twab_byFakeId() removeObjectForKey:fakeId];
+        NSDictionary<NSString *, NSNumber *> *roomRefs =
+            [twab_roomFakeIds()[evicted] copy];
+        for (NSString *fakeId in roomRefs) {
+            NSUInteger total = [twab_fakeIdRefCounts()[fakeId] unsignedIntegerValue];
+            NSUInteger removed = [roomRefs[fakeId] unsignedIntegerValue];
+            if (total <= removed) {
+                [twab_fakeIdRefCounts() removeObjectForKey:fakeId];
+                [twab_byFakeId() removeObjectForKey:fakeId];
+            } else {
+                twab_fakeIdRefCounts()[fakeId] = @(total - removed);
+            }
         }
         [twab_byRoomWord() removeObjectForKey:evicted];
         [twab_roomFakeIds() removeObjectForKey:evicted];
         os_log(OS_LOG_DEFAULT,
                "[TWAB-Emote] evicted room=%{public}@ emotes=%lu",
-               evicted, (unsigned long)fakeIds.count);
+               evicted, (unsigned long)roomRefs.count);
     }
 }
 
@@ -402,6 +452,7 @@ void twab_reloadEmotes(void) {
         [twab_loadedRooms() removeAllObjects];
         [twab_lruRooms() removeAllObjects];
         [twab_roomFakeIds() removeAllObjects];
+        [twab_fakeIdRefCounts() removeAllObjects];
         os_log(OS_LOG_DEFAULT, "[TWAB-Emote] registry cleared by user reload");
     });
     // Re-fetch globals off the barrier — twab_loadGlobalEmotes only kicks off
