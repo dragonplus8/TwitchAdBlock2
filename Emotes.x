@@ -16,7 +16,7 @@
 //      with a new `room-id=`, kick off async fetches against the 7TV, BTTV,
 //      and FFZ public APIs. Globals are loaded once at startup. Per-channel
 //      sets are tracked in an LRU (capped at TWAB_MAX_ROOMS); when a room
-//      is evicted, its first-write-wins emote entries are removed too.
+//      is evicted, its emote entries are removed too.
 //      Globals (TWAB_GLOBAL_ROOM) are never evicted.
 //
 // Known limitations:
@@ -62,7 +62,10 @@ static dispatch_queue_t twab_emoteQueue(void) {
     return q;
 }
 
-static NSMutableDictionary<NSString *, NSDictionary *> *twab_byWord(void) {
+// room -> word -> provider -> entry. Keeping all three levels prevents an
+// emote loaded for one channel from leaking into another channel and makes
+// provider precedence independent of network response timing.
+static NSMutableDictionary *twab_byRoomWord(void) {
     static NSMutableDictionary *m;
     static dispatch_once_t once;
     dispatch_once(&once, ^{ m = [NSMutableDictionary dictionary]; });
@@ -110,9 +113,9 @@ static uint64_t twab_nextSyntheticId(void) {
 }
 
 // Register an emote word -> (provider, realId, animated, room). Allocates a
-// synthetic id and updates all indexes atomically. First write wins per
-// word; later writes with the same word are silently dropped, even from
-// a different room. `room` of nil means "global" — never evicted. The
+// synthetic id and updates all indexes atomically. Entries are scoped by room
+// and provider so duplicate names cannot be decided by whichever API request
+// happens to finish first. `room` of nil means "global" — never evicted. The
 // `animated` flag drives format selection in twab_rewriteEmoteURL —
 // animated emotes need .gif on 7TV (only GIF carries animation in the
 // renderer); static emotes need .webp (some 7TV emotes lack a GIF
@@ -123,17 +126,27 @@ static void twab_registerEmote(NSString *word, NSString *provider,
     if (!word.length || !provider.length || !realId.length) return;
     NSString *roomKey = room.length ? room : TWAB_GLOBAL_ROOM;
     dispatch_barrier_async(twab_emoteQueue(), ^{
-        if (twab_byWord()[word]) return;
+        NSMutableDictionary *words = twab_byRoomWord()[roomKey];
+        if (!words) {
+            words = [NSMutableDictionary dictionary];
+            twab_byRoomWord()[roomKey] = words;
+        }
+        NSMutableDictionary *providers = words[word];
+        if (!providers) {
+            providers = [NSMutableDictionary dictionary];
+            words[word] = providers;
+        }
+        if (providers[provider]) return;
+
         NSString *fakeId = [NSString stringWithFormat:@"%llu", twab_nextSyntheticId()];
-        twab_byWord()[word] = @{@"provider": provider,
+        NSDictionary *entry = @{@"provider": provider,
                                 @"id": realId,
                                 @"fake": fakeId,
+                                @"word": word,
+                                @"room": roomKey,
                                 @"animated": @(animated)};
-        twab_byFakeId()[fakeId] = @{@"provider": provider,
-                                    @"id": realId,
-                                    @"word": word,
-                                    @"room": roomKey,
-                                    @"animated": @(animated)};
+        providers[provider] = entry;
+        twab_byFakeId()[fakeId] = entry;
         NSMutableSet *set = twab_roomFakeIds()[roomKey];
         if (!set) {
             set = [NSMutableSet set];
@@ -154,11 +167,9 @@ static void twab_evictOldestRoomsLocked(void) {
         [twab_loadedRooms() removeObject:evicted];
         NSSet *fakeIds = [twab_roomFakeIds()[evicted] copy];
         for (NSString *fakeId in fakeIds) {
-            NSDictionary *entry = twab_byFakeId()[fakeId];
-            NSString *word = entry[@"word"];
-            if (word) [twab_byWord() removeObjectForKey:word];
             [twab_byFakeId() removeObjectForKey:fakeId];
         }
+        [twab_byRoomWord() removeObjectForKey:evicted];
         [twab_roomFakeIds() removeObjectForKey:evicted];
         os_log(OS_LOG_DEFAULT,
                "[TWAB-Emote] evicted room=%{public}@ emotes=%lu",
@@ -166,11 +177,27 @@ static void twab_evictOldestRoomsLocked(void) {
     }
 }
 
-static NSString *twab_fakeIdForWord(NSString *word) {
+// Resolution order is deliberate and stable:
+//   channel 7TV -> BTTV -> FFZ -> global 7TV -> BTTV -> FFZ.
+// Channel entries always beat globals, while provider collisions no longer
+// depend on which asynchronous fetch completed first.
+static NSString *twab_fakeIdForWord(NSString *word, NSString *roomId) {
     __block NSString *result = nil;
     dispatch_sync(twab_emoteQueue(), ^{
-        NSDictionary *e = twab_byWord()[word];
-        result = e ? e[@"fake"] : nil;
+        NSArray<NSString *> *scopes = roomId.length
+            ? @[ roomId, TWAB_GLOBAL_ROOM ]
+            : @[ TWAB_GLOBAL_ROOM ];
+        NSArray<NSString *> *providers = @[ @"7tv", @"bttv", @"ffz" ];
+        for (NSString *scope in scopes) {
+            NSDictionary *byProvider = twab_byRoomWord()[scope][word];
+            for (NSString *provider in providers) {
+                NSDictionary *entry = byProvider[provider];
+                if (entry) {
+                    result = entry[@"fake"];
+                    return;
+                }
+            }
+        }
     });
     return result;
 }
@@ -370,7 +397,7 @@ static void twab_loadChannelEmotes(NSString *roomId) {
 // all mutation happens under the emote queue's barrier.
 void twab_reloadEmotes(void) {
     dispatch_barrier_async(twab_emoteQueue(), ^{
-        [twab_byWord() removeAllObjects];
+        [twab_byRoomWord() removeAllObjects];
         [twab_byFakeId() removeAllObjects];
         [twab_loadedRooms() removeAllObjects];
         [twab_lruRooms() removeAllObjects];
@@ -633,17 +660,69 @@ static NSString *twab_extractTag(NSString *tagsPart, NSString *key) {
     return [tagsPart substringWithRange:NSMakeRange(start, end - start)];
 }
 
-// Count grapheme clusters over a range. Close enough to Unicode code points
-// for normal chat content (emoji ZWJ sequences differ, but those are rare
-// in chat text and Twitch's parser is grapheme-cluster oriented anyway).
-static NSUInteger twab_charCount(NSString *s, NSRange range) {
-    __block NSUInteger n = 0;
-    [s enumerateSubstringsInRange:range
-                          options:NSStringEnumerationByComposedCharacterSequences
-                       usingBlock:^(NSString *sub, NSRange r, NSRange er, BOOL *stop) {
-        n++;
-    }];
-    return n;
+// Count Unicode scalar values (code points), matching Twitch's IRC emote
+// offsets. NSString indexes UTF-16 code units, so a valid surrogate pair is
+// one position. ZWJ, variation selectors, and combining marks intentionally
+// remain separate positions; collapsing them into a grapheme cluster shifts
+// every emote range that follows a multi-code-point emoji.
+static NSUInteger twab_codePointCount(NSString *s, NSRange range) {
+    if (!s.length || range.location > s.length) return 0;
+    NSUInteger rangeEnd = NSMaxRange(range);
+    if (rangeEnd < range.location || rangeEnd > s.length) return 0;
+
+    NSUInteger count = 0;
+    for (NSUInteger i = range.location; i < rangeEnd; i++) {
+        unichar c = [s characterAtIndex:i];
+        if (CFStringIsSurrogateHighCharacter(c) && i + 1 < rangeEnd) {
+            unichar next = [s characterAtIndex:i + 1];
+            if (CFStringIsSurrogateLowCharacter(next)) i++;
+        }
+        count++;
+    }
+    return count;
+}
+
+static BOOL twab_parseUnsignedInteger(NSString *s, NSUInteger *value) {
+    if (!s.length || !value) return NO;
+    NSScanner *scanner = [NSScanner scannerWithString:s];
+    unsigned long long parsed = 0;
+    if (![scanner scanUnsignedLongLong:&parsed] || !scanner.isAtEnd ||
+        parsed > NSUIntegerMax) return NO;
+    *value = (NSUInteger)parsed;
+    return YES;
+}
+
+// Parse Twitch's existing inclusive emote ranges. Invalid/out-of-bounds
+// ranges are ignored defensively instead of allowing a malformed IRC tag to
+// suppress every third-party emote in the message.
+static NSArray<NSValue *> *twab_parseEmoteRanges(NSString *value,
+                                                 NSUInteger textLength) {
+    if (!value.length || textLength == 0) return @[];
+    NSMutableArray<NSValue *> *ranges = [NSMutableArray array];
+    for (NSString *emote in [value componentsSeparatedByString:@"/"]) {
+        NSRange colon = [emote rangeOfString:@":"];
+        if (colon.location == NSNotFound || NSMaxRange(colon) >= emote.length) continue;
+        NSString *positions = [emote substringFromIndex:NSMaxRange(colon)];
+        for (NSString *position in [positions componentsSeparatedByString:@","]) {
+            NSRange dash = [position rangeOfString:@"-"];
+            if (dash.location == NSNotFound || dash.location == 0 ||
+                NSMaxRange(dash) >= position.length) continue;
+            NSUInteger start = 0;
+            NSUInteger end = 0;
+            if (!twab_parseUnsignedInteger([position substringToIndex:dash.location], &start) ||
+                !twab_parseUnsignedInteger([position substringFromIndex:NSMaxRange(dash)], &end) ||
+                end < start || end >= textLength) continue;
+            [ranges addObject:[NSValue valueWithRange:NSMakeRange(start, end - start + 1)]];
+        }
+    }
+    return ranges;
+}
+
+static BOOL twab_rangeOverlapsAny(NSRange candidate, NSArray<NSValue *> *ranges) {
+    for (NSValue *boxed in ranges) {
+        if (NSIntersectionRange(candidate, boxed.rangeValue).length > 0) return YES;
+    }
+    return NO;
 }
 
 // Observe non-PRIVMSG lines (ROOMSTATE etc.) for room-id so we can preload
@@ -680,15 +759,22 @@ static NSString *twab_injectIRCEmotes(NSString *line) {
     NSString *roomId = twab_extractTag(tagsPart, @"room-id");
     if (roomId.length) twab_loadChannelEmotes(roomId);
 
-    // Scan words for matches. Positions are code-point-based, so we track a
-    // grapheme-cluster cursor separately from any UTF-16 indexing.
+    NSUInteger textLength = twab_codePointCount(text, NSMakeRange(0, text.length));
+    NSString *existingEmotes = twab_extractTag(tagsPart, @"emotes");
+    NSArray<NSValue *> *occupiedRanges =
+        twab_parseEmoteRanges(existingEmotes, textLength);
+
+    // Scan words for matches. Positions are code-point-based and any range
+    // already claimed by a native Twitch emote is left untouched.
     NSMutableArray<NSString *> *newEntries = [NSMutableArray array];
     NSArray<NSString *> *words = [text componentsSeparatedByString:@" "];
     NSUInteger codePos = 0;
     for (NSString *word in words) {
-        NSUInteger wordLen = twab_charCount(word, NSMakeRange(0, word.length));
-        NSString *fakeId = twab_fakeIdForWord(word);
-        if (fakeId && wordLen > 0) {
+        NSUInteger wordLen = twab_codePointCount(word, NSMakeRange(0, word.length));
+        NSRange wordRange = NSMakeRange(codePos, wordLen);
+        NSString *fakeId = twab_fakeIdForWord(word, roomId);
+        if (fakeId && wordLen > 0 &&
+            !twab_rangeOverlapsAny(wordRange, occupiedRanges)) {
             NSUInteger end = codePos + wordLen - 1;
             [newEntries addObject:[NSString stringWithFormat:@"%@:%lu-%lu",
                                    fakeId, (unsigned long)codePos, (unsigned long)end]];
