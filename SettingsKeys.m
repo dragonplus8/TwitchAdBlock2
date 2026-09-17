@@ -12,6 +12,7 @@ NSString *const TWABKeyLaunchTab                 = @"TWLaunchTab";
 NSString *const TWABKeyLaunchSubTab              = @"TWLaunchSubTab";
 NSString *const TWABKeyHideStories               = @"TWHideStories";
 NSString *const TWABKeyHideAdFreeButton          = @"TWHideAdFreeButton";
+NSString *const TWABKeyHideOverlayEngagementButtons = @"TWHideOverlayEngagementButtons";
 NSString *const TWABKeyDisableWatchLimit         = @"TWDisableWatchLimit";
 
 NSString *twab_effectiveProxyAddress(void) {
