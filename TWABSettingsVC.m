@@ -7,6 +7,9 @@ extern NSBundle *tweakBundle;
 extern NSUserDefaults *tweakDefaults;
 // Emotes.x — clears the emote registry and re-fetches global sets.
 extern void twab_reloadEmotes(void);
+// Overlay.x — immediately hides any matching player views already on screen.
+extern void twab_hideCurrentOverlayEngagementViews(void);
+extern BOOL twab_hideOverlayEngagementButtonsEnabled(void);
 // Tweak.x — [{ @"name": NSString, @"present": @(BOOL) }, ...] for the
 // hooked Twitch classes, recorded at launch.
 extern NSArray<NSDictionary *> *twab_classDiagnostics(void);
@@ -172,7 +175,7 @@ extern NSArray<NSDictionary *> *twab_classDiagnostics(void);
 //   0: Ad Block toggle           (always shown)
 //   1: Proxy + custom proxy      (only when ad block is on)
 //   2: Emotes toggle + reload    (always shown)
-//   3: Home: launch / stories / keep-live-feed
+//   3: Home: launch / stories / player-overlay buttons / keep-live-feed
 //   4: Tools: export / import / diagnostics
 //   5: empty / version footer    (always shown — last section)
 
@@ -215,7 +218,7 @@ static const TWABLaunchOpt kLaunchOpts[] = {
             // + "Add proxy" row) + status
             return self.customProxyEnabled ? (3 + (NSInteger)self.proxies.count + 1) : 3;
         case 2: return 2;  // emotes toggle + reload-emotes action
-        case 3: return 3;  // launch dropdown + hide-stories toggle + watch-limit toggle
+        case 3: return 4;  // launch + stories + overlay buttons + watch-limit
         case 4: return 3;  // Tools: export, import, diagnostics
         case 5: return 0;  // version footer only
         default: return 0;
@@ -328,6 +331,14 @@ static const TWABLaunchOpt kLaunchOpts[] = {
                                              on:[tweakDefaults boolForKey:TWABKeyHideStories]
                                          action:@selector(hideStoriesSwitchChanged:)
                                      identifier:@"HideStoriesSwitch"];
+            if (indexPath.row == 2)
+                return [self switchCellWithTitle:LOC(@"settings.hideoverlaybuttons.title",
+                                                     @"Hide Player Engagement Buttons")
+                                        subtitle:LOC(@"settings.hideoverlaybuttons.desc",
+                                                     @"Hide the chat buttons left over the video when player controls fade.")
+                                             on:twab_hideOverlayEngagementButtonsEnabled()
+                                         action:@selector(hideOverlayEngagementButtonsSwitchChanged:)
+                                     identifier:@"HideOverlayEngagementButtonsSwitch"];
             return [self switchCellWithTitle:LOC(@"settings.watchlimit.title",
                                                  @"Keep Live Feed Playing")
                                     subtitle:LOC(@"settings.watchlimit.desc",
@@ -856,6 +867,11 @@ static const NSInteger kProxyDownButtonTag = 0xAB02;
     [tweakDefaults setBool:sw.on forKey:TWABKeyHideStories];
 }
 
+- (void)hideOverlayEngagementButtonsSwitchChanged:(UISwitch *)sw {
+    [tweakDefaults setBool:sw.on forKey:TWABKeyHideOverlayEngagementButtons];
+    if (sw.on) twab_hideCurrentOverlayEngagementViews();
+}
+
 - (void)disableWatchLimitSwitchChanged:(UISwitch *)sw {
     [tweakDefaults setBool:sw.on forKey:TWABKeyDisableWatchLimit];
 }
@@ -874,7 +890,7 @@ static NSArray<NSString *> *twab_exportKeys(void) {
               TWABKeyAdBlockCustomProxyEnabled, TWABKeyAdBlockProxy,
               TWABKeyEmotesEnabled, TWABKeyLaunchTab, TWABKeyLaunchSubTab,
               TWABKeyHideStories, TWABKeyDisableWatchLimit,
-              TWABKeyHideAdFreeButton ];
+              TWABKeyHideAdFreeButton, TWABKeyHideOverlayEngagementButtons ];
 }
 
 - (void)reloadEmotesTapped:(UIView *)anchor {
