@@ -24,6 +24,9 @@ extern NSString *const TWABKeyHideStories;
 // BOOL — when YES, the Turbo "Go Ad-Free" upsell banner on the Following tab
 // is hidden/collapsed on layout.
 extern NSString *const TWABKeyHideAdFreeButton;
+// BOOL — when YES, hide Twitch's SwiftUI chat-engagement buttons that remain
+// over the video after the standard player controls fade.
+extern NSString *const TWABKeyHideOverlayEngagementButtons;
 // BOOL — when YES, the Evolve "Live" feed's max-watch-time limit is
 // neutralized so a live preview keeps playing instead of stopping and
 // showing the Watch/Follow blocking overlay. Implemented by rewriting the
